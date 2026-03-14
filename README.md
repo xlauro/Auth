@@ -1,97 +1,103 @@
 # Auth Service
 
-Modern .NET 10 authentication API built with clean architecture boundaries (API ➜ Application ➜ Domain ➜ Infrastructure). It exposes user registration and login backed by EF Core + SQLite, FluentValidation rules, JWT issuance, and a growing automated test suite.
+_A portfolio-ready authentication slice that demonstrates clean architecture, EF Core data access, FluentValidation, and JWT issuance on .NET 10._
 
-## Why It Stands Out
+## TL;DR for Busy Engineers
 
-- **Layered architecture:** Each project owns a single responsibility, making business rules portable and testable.
-- **Robust validation & error handling:** FluentValidation in the application layer plus domain-specific exceptions and a global middleware guarantee consistent HTTP responses.
-- **Secure defaults:** Passwords are hashed (SHA-256 placeholder) before persistence and JWT access tokens are issued with configurable issuer/audience/secret.
-- **EF Core ready:** Infrastructure project ships with DbContext + repository abstraction; API bootstraps migrations automatically via `EnsureCreated()` and is prepared for future `dotnet ef` migrations.
-- **Test-driven confidence:** Unit tests cover register/login use-cases and controller behavior, while WebApplicationFactory-based integration tests exercise the full pipeline (DI, middleware, JWT, EF Core).
+- **Separation of concerns**: API, Application, Domain, Infrastructure, and Tests are isolated projects with explicit references, making the codebase easy to reason about.
+- **End-to-end happy path**: `/auth/register` ➜ validate ➜ hash ➜ persist ➜ `/auth/login` ➜ issue JWT signed with configurable issuer/audience/secret.
+- **Guard rails included**: domain exceptions, validation errors, and unexpected failures flow through a middleware that converts them to HTTP-friendly payloads.
+- **Confidence via tests**: unit, controller, and TestServer-driven integration cases run in <5s and cover the real pipeline (DI, EF Core, JWT).
 
-## Solution Topology
-
+## Architecture Cheatsheet
 ```
-Auth.sln
-├── Auth.Api            # ASP.NET Core API (controllers, middleware, DI)
-├── Auth.Application    # Use cases, abstractions, validation orchestration
-├── Auth.Domain         # Entities, validation rules, domain exceptions
-├── Auth.Infrastructure # EF Core, repositories, JWT services, data access
-└── Auth.Tests          # xUnit suite (unit + integration via TestServer)
-```
-
-## Getting Started
-
-### Prerequisites
-- .NET SDK 10.0.201 or later
-- SQLite (bundled with .NET provider, no separate install required)
-
-### Configuration
-Set the connection string and JWT secrets in `Auth.Api/appsettings.Development.json` (dev) or `appsettings.json` (prod-style). Example:
-
-```json
-{
-  "ConnectionStrings": {
-    "DefaultConnection": "Data Source=auth.dev.db"
-  },
-  "Jwt": {
-    "Issuer": "AuthApi.Dev",
-    "Audience": "AuthApiClients.Dev",
-    "Secret": "REPLACE_ME_WITH_A_SECURE_DEV_SECRET",
-    "ExpiresMinutes": 120
-  }
-}
+Client
+  │
+  ▼
+Auth.Api (Controllers, DI, middleware, JWT auth)
+  │          ▲ (DTOs, exception middleware)
+  ▼          │
+Auth.Application (Register/Login use cases, validation, abstractions)
+  │          ▲
+  ▼          │
+Auth.Domain (Entities, FluentValidation rules, custom exceptions)
+  │          ▲
+  ▼          │
+Auth.Infrastructure (EF Core DbContext + repositories, JwtTokenGenerator)
 ```
 
-### Run the API
+Key decisions:
+- **Repository abstraction (`IUserRepository`)** keeps the use cases persistence-agnostic.
+- **`UserValidation` + `ApplicationValidationException`** centralize input and entity-level guarantees.
+- **`EnsureCreated()` bootstrap** is used during development; swap to migrations (`dotnet ef ...`) when the toolchain is available.
+- **JWT signing** relies on `Microsoft.IdentityModel.Tokens` with secrets sourced from configuration, so rotating keys or moving to KeyVault is trivial.
+
+## Project Map
+
+| Project             | Responsibility | Interesting bits |
+|---------------------|----------------|------------------|
+| `Auth.Api`          | HTTP surface, DI modules, exception middleware, JWT setup | `Extensions/` hides the hosting plumbing so `Program.cs` stays minimal. |
+| `Auth.Application`  | Register/Login use cases, validation orchestration        | Uses FluentValidation + SHA256 hashing (ready to swap for PBKDF2). |
+| `Auth.Domain`       | Entities, value constraints, domain exceptions            | Lightweight and persistence-agnostic. |
+| `Auth.Infrastructure` | EF Core DbContext, user repository, JWT token generator  | Targets SQLite for portability. |
+| `Auth.Tests`        | xUnit suite: unit, controller, and TestServer integration  | In-memory EF + SQLite makes the suite deterministic and quick. |
+
+## Local Dev Workflow
 
 ```bash
+# 1. Restore & build
 cd /home/xlauro/RiderProjects/Auth
+DOTNET_ENVIRONMENT=Development dotnet build
+
+# 2. Update settings if needed
+code Auth.Api/appsettings.Development.json
+
+# 3. Run the API (Swagger UI available at /scalar/v1)
 DOTNET_ENVIRONMENT=Development dotnet run --project Auth.Api/Auth.Api.csproj
 ```
 
-The app hosts Swagger (Scalar) UI at `/scalar/v1` in Development. The pipeline automatically ensures the SQLite database exists on startup.
+Configuration knobs live under `ConnectionStrings:DefaultConnection` and `Jwt:*`. Secrets are plain text for dev convenience—swap to user secrets, Azure App Config, or AWS Parameter Store when hosting for real.
 
-## API Surface
+## API Contract
 
-| Endpoint            | Method | Body                               | Response                   |
-|---------------------|--------|------------------------------------|----------------------------|
-| `/auth/register`    | POST   | `{ "email": "user@x.com", "password": "P@ss" }` | `200 OK` + user id/email   |
-| `/auth/login`       | POST   | `{ "email": "user@x.com", "password": "P@ss" }` | `200 OK` + JWT access token |
+| Endpoint | Description | Sample Request | Sample Response |
+|----------|-------------|----------------|-----------------|
+| `POST /auth/register` | Creates a new user if the email is unique. | `{ "email": "alice@example.com", "password": "P@ssw0rd!" }` | `{ "id": "GUID", "email": "alice@example.com" }` |
+| `POST /auth/login` | Exchanges valid credentials for a JWT. | `{ "email": "alice@example.com", "password": "P@ssw0rd!" }` | `{ "token": "eyJhbGc..." }` |
 
-Errors bubble through the exception middleware:
-- `409 Conflict` when a user already exists
-- `404 Not Found` for missing users on login
-- `400 Bad Request` for validation problems
+Failure modes delivered by the exception middleware:
+- `400 Bad Request` with a validation error array.
+- `404 Not Found` when login targets a non-existent user.
+- `409 Conflict` when attempting to register an existing email.
+- `500 Internal Server Error` with a sanitized payload for everything else.
 
-## Testing & Quality Gates
+## Quality Gates
 
-Run the whole suite (unit + integration) with:
+| Test Layer | Tech | Scope |
+|------------|------|-------|
+| Unit (`UseCasesTests`) | xUnit + EF InMemory | Register/Login behavior, validation, hashing |
+| Controller (`AuthControllerTests`) | xUnit + fake repo/token | HTTP semantics and exception translation |
+| Integration (`AuthIntegrationTests`) | WebApplicationFactory + SQLite in-memory | Real DI container, middleware, JWT, EF Core |
 
+Run everything:
 ```bash
 cd /home/xlauro/RiderProjects/Auth
 DOTNET_ENVIRONMENT=Development dotnet test
 ```
 
-Highlights:
-- `UseCasesTests` validate registration/login flows with EF InMemory.
-- `AuthControllerTests` simulate controller behavior via fake repos/token generator.
-- `AuthIntegrationTests` spin up the real API via `WebApplicationFactory<Program>` against in-memory SQLite to ensure middleware, DI, and JWT issuance work end-to-end.
+## Future Enhancements (Intentionally Left TODO)
 
-## Extending the Solution
+1. **Upgrade hashing** to PBKDF2/BCrypt + salt + pepper service.
+2. **Introduce migrations** once `dotnet-ef` is installed; hook into CI/CD pipelines.
+3. **Authorization policies** for role/claims-based protection of future endpoints.
+4. **Observability hooks** (Serilog + OpenTelemetry) for traceability in distributed systems.
+5. **Secrets management** via environment variables or dedicated secret stores.
 
-1. **Production-grade password hashing:** swap the SHA-256 placeholder with PBKDF2, BCrypt, or Argon2.
-2. **Migrations:** once `dotnet-ef` tooling is available, run `dotnet ef migrations add InitialCreate -p Auth.Infrastructure -s Auth.Api` and `dotnet ef database update` to move off `EnsureCreated()`.
-3. **Authorization policies:** add role/claim-based policies and decorate controllers with `[Authorize]` as endpoints grow.
-4. **Observability:** plug in Serilog + OpenTelemetry exporters for structured logs and traces.
+## Conversation Starters
 
-## Talking Points for Recruiters
+- Clean architecture discipline enforced via project references and abstractions.
+- Middleware-first error handling that keeps controllers lean.
+- Test strategy that mirrors how production requests travel through the stack.
+- Easy on-ramp for cloud deployment (single SQLite file today, switch to Postgres/SQL Server tomorrow by editing `AppDbContext`).
 
-- Demonstrates ability to design clean boundaries and enforce them via project references and abstractions.
-- Shows comfort with modern ASP.NET Core patterns (minimal `Program.cs`, DI modules, middleware).
-- Proves testing mindset through both unit and integration coverage, including realistic in-memory SQLite hosting.
-- Ready for cloud/containers due to zero external dependencies beyond SQLite; secrets isolated to configuration.
-
-Feel free to reach out if you'd like a guided tour or want to see roadmap items in action!
-
+> _Want to see it live or discuss trade-offs? Ping me and we can pair-program through a feature or migration strategy._
